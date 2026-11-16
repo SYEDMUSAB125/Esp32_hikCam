@@ -1,0 +1,497 @@
+
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <esp_http_client.h>
+#include <time.h>
+
+// =====================================================
+// WIFI
+// =====================================================
+
+const char* WIFI_SSID = "Syed_Musab_pc";
+const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+
+// =====================================================
+// HIKVISION CAMERA
+// =====================================================
+
+// Your camera's existing IP address
+const char* CAMERA_URL =
+  "http://192.168.137.211/ISAPI/Streaming/channels/102/picture";
+
+const char* CAMERA_USERNAME = "admin";
+const char* CAMERA_PASSWORD = "YOUR_CAMERA_PASSWORD";
+
+// =====================================================
+// FIREBASE
+// =====================================================
+
+const char* FIREBASE_API_KEY = "YOUR_FIREBASE_WEB_API_KEY";
+
+const char* FIREBASE_EMAIL = "YOUR_FIREBASE_EMAIL";
+const char* FIREBASE_PASSWORD = "YOUR_FIREBASE_PASSWORD";
+
+const char* FIREBASE_BUCKET =
+  "breathe-easy-ned.firebasestorage.app";
+
+const char* FIREBASE_DATABASE_URL =
+  "https://breathe-easy-ned-default-rtdb.firebaseio.com";
+
+// =====================================================
+// CONFIGURATION
+// =====================================================
+
+const unsigned long CAPTURE_INTERVAL = 5000;
+const unsigned long AUTH_REFRESH_INTERVAL = 50UL * 60UL * 1000UL;
+
+// Adjust this if the sub-stream produces larger JPEGs.
+// Keep the camera sub-stream at a modest resolution.
+#define MAX_JPEG_SIZE (160 * 1024)
+
+// =====================================================
+// GLOBAL VARIABLES
+// =====================================================
+
+WiFiClientSecure secureClient;
+
+String firebaseIdToken = "";
+
+unsigned long lastAuthTime = 0;
+unsigned long lastCaptureTime = 0;
+
+uint8_t jpegBuffer[MAX_JPEG_SIZE];
+size_t jpegLength = 0;
+bool jpegOverflow = false;
+
+// =====================================================
+// CAMERA DATA CALLBACK
+// =====================================================
+
+esp_err_t cameraEventHandler(esp_http_client_event_t *evt) {
+
+  switch (evt->event_id) {
+
+    case HTTP_EVENT_ON_CONNECTED:
+      jpegLength = 0;
+      jpegOverflow = false;
+      break;
+
+    case HTTP_EVENT_ON_DATA:
+
+      if (jpegLength + evt->data_len <= MAX_JPEG_SIZE) {
+
+        memcpy(
+          jpegBuffer + jpegLength,
+          evt->data,
+          evt->data_len
+        );
+
+        jpegLength += evt->data_len;
+
+      } else {
+        jpegOverflow = true;
+      }
+
+      break;
+
+    default:
+      break;
+  }
+
+  return ESP_OK;
+}
+
+// =====================================================
+// WIFI CONNECTION
+// =====================================================
+
+void connectWiFi() {
+
+  if (WiFi.status() == WL_CONNECTED) {
+    return;
+  }
+
+  Serial.println("Connecting to WiFi...");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+  Serial.println("WiFi connected");
+
+  Serial.print("ESP32 IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+// =====================================================
+// FIREBASE EMAIL/PASSWORD LOGIN
+// =====================================================
+
+bool firebaseSignIn() {
+
+  Serial.println("Signing in to Firebase...");
+
+  HTTPClient http;
+
+  String url =
+    "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=";
+
+  url += FIREBASE_API_KEY;
+
+  if (!http.begin(secureClient, url)) {
+    Serial.println("Firebase connection failed");
+    return false;
+  }
+
+  http.addHeader("Content-Type", "application/json");
+
+  StaticJsonDocument<512> requestDoc;
+
+  requestDoc["email"] = FIREBASE_EMAIL;
+  requestDoc["password"] = FIREBASE_PASSWORD;
+  requestDoc["returnSecureToken"] = true;
+
+  String requestBody;
+  serializeJson(requestDoc, requestBody);
+
+  int responseCode = http.POST(requestBody);
+
+  String response = http.getString();
+
+  http.end();
+
+  if (responseCode != 200) {
+
+    Serial.print("Firebase login failed: ");
+    Serial.println(responseCode);
+
+    Serial.println(response);
+
+    return false;
+  }
+
+  DynamicJsonDocument responseDoc(4096);
+
+  DeserializationError error =
+    deserializeJson(responseDoc, response);
+
+  if (error) {
+    Serial.println("Firebase JSON parsing failed");
+    return false;
+  }
+
+  firebaseIdToken =
+    responseDoc["idToken"].as<String>();
+
+  if (firebaseIdToken.length() == 0) {
+    Serial.println("Firebase ID token missing");
+    return false;
+  }
+
+  lastAuthTime = millis();
+
+  Serial.println("Firebase login successful");
+
+  return true;
+}
+
+// =====================================================
+// ENSURE FIREBASE TOKEN IS VALID
+// =====================================================
+
+bool ensureFirebaseAuth() {
+
+  if (firebaseIdToken.length() == 0) {
+    return firebaseSignIn();
+  }
+
+  if (millis() - lastAuthTime >= AUTH_REFRESH_INTERVAL) {
+    return firebaseSignIn();
+  }
+
+  return true;
+}
+
+// =====================================================
+// CAPTURE HIKVISION CAMERA IMAGE
+// =====================================================
+
+bool captureCameraImage() {
+
+  Serial.println("Capturing camera image...");
+
+  jpegLength = 0;
+  jpegOverflow = false;
+
+  esp_http_client_config_t config = {};
+
+  config.url = CAMERA_URL;
+
+  config.username = CAMERA_USERNAME;
+  config.password = CAMERA_PASSWORD;
+
+  // Hikvision Digest Authentication
+  config.auth_type = HTTP_AUTH_TYPE_DIGEST;
+
+  config.timeout_ms = 15000;
+  config.buffer_size = 4096;
+  config.buffer_size_tx = 1024;
+
+  config.event_handler = cameraEventHandler;
+
+  esp_http_client_handle_t client =
+    esp_http_client_init(&config);
+
+  if (client == nullptr) {
+    Serial.println("Camera HTTP client initialization failed");
+    return false;
+  }
+
+  esp_err_t result =
+    esp_http_client_perform(client);
+
+  int statusCode =
+    esp_http_client_get_status_code(client);
+
+  esp_http_client_cleanup(client);
+
+  if (result != ESP_OK) {
+
+    Serial.print("Camera request error: ");
+    Serial.println(esp_err_to_name(result));
+
+    return false;
+  }
+
+  if (statusCode != 200) {
+
+    Serial.print("Camera HTTP status: ");
+    Serial.println(statusCode);
+
+    return false;
+  }
+
+  if (jpegOverflow) {
+    Serial.println("JPEG exceeds buffer size");
+    return false;
+  }
+
+  // Check JPEG start marker
+  if (
+    jpegLength < 4 ||
+    jpegBuffer[0] != 0xFF ||
+    jpegBuffer[1] != 0xD8
+  ) {
+    Serial.println("Invalid JPEG image");
+    return false;
+  }
+
+  Serial.print("Image captured: ");
+  Serial.print(jpegLength);
+  Serial.println(" bytes");
+
+  return true;
+}
+
+// =====================================================
+// UPLOAD IMAGE TO FIREBASE STORAGE
+// =====================================================
+
+int uploadToStorage() {
+
+  Serial.println("Uploading image to Firebase Storage...");
+
+  HTTPClient http;
+
+  String url =
+    "https://firebasestorage.googleapis.com/v0/b/";
+
+  url += FIREBASE_BUCKET;
+  url += "/o?uploadType=media&name=hikcam%2Flatest.jpg";
+
+  if (!http.begin(secureClient, url)) {
+    Serial.println("Storage connection failed");
+    return -1;
+  }
+
+  http.addHeader(
+    "Authorization",
+    "Firebase " + firebaseIdToken
+  );
+
+  http.addHeader("Content-Type", "image/jpeg");
+
+  int responseCode =
+    http.POST(jpegBuffer, jpegLength);
+
+  String response = http.getString();
+
+  http.end();
+
+  if (responseCode == 200) {
+
+    Serial.println("Image uploaded successfully");
+
+  } else {
+
+    Serial.print("Storage upload failed: ");
+    Serial.println(responseCode);
+
+    Serial.println(response);
+  }
+
+  return responseCode;
+}
+
+// =====================================================
+// UPDATE FIREBASE REALTIME DATABASE
+// =====================================================
+
+int updateRealtimeDatabase() {
+
+  Serial.println("Updating Realtime Database...");
+
+  HTTPClient http;
+
+  String url = FIREBASE_DATABASE_URL;
+
+  url += "/hikcam/latest_frame.json?auth=";
+  url += firebaseIdToken;
+
+  if (!http.begin(secureClient, url)) {
+    Serial.println("Database connection failed");
+    return -1;
+  }
+
+  http.addHeader("Content-Type", "application/json");
+
+  StaticJsonDocument<512> document;
+
+  document["storagePath"] = "hikcam/latest.jpg";
+  document["bucket"] = FIREBASE_BUCKET;
+  document["contentType"] = "image/jpeg";
+  document["sizeBytes"] = jpegLength;
+
+  time_t now = time(nullptr);
+
+  if (now > 1700000000) {
+    document["capturedAtUnix"] = (long long)now;
+  }
+
+  String jsonData;
+
+  serializeJson(document, jsonData);
+
+  int responseCode = http.PUT(jsonData);
+
+  String response = http.getString();
+
+  http.end();
+
+  if (responseCode == 200) {
+
+    Serial.println("Database updated successfully");
+
+  } else {
+
+    Serial.print("Database update failed: ");
+    Serial.println(responseCode);
+
+    Serial.println(response);
+  }
+
+  return responseCode;
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  delay(1000);
+
+  Serial.println();
+  Serial.println("Hikvision ESP32 Firebase System");
+
+  connectWiFi();
+
+  // TESTING ONLY:
+  // This disables TLS certificate verification.
+  // Replace with trusted CA certificate validation
+  // before deploying this device.
+  secureClient.setInsecure();
+
+  // Synchronize time for capture timestamps
+  configTime(
+    0,
+    0,
+    "pool.ntp.org",
+    "time.google.com"
+  );
+
+  firebaseSignIn();
+
+  Serial.println("System ready");
+}
+
+// =====================================================
+// MAIN LOOP
+// =====================================================
+
+void loop() {
+
+  connectWiFi();
+
+  if (!ensureFirebaseAuth()) {
+
+    Serial.println("Firebase authentication unavailable");
+
+    delay(3000);
+
+    return;
+  }
+
+  if (millis() - lastCaptureTime >= CAPTURE_INTERVAL) {
+
+    // Capture one fresh image; no frame queue.
+    if (captureCameraImage()) {
+
+      int storageStatus = uploadToStorage();
+
+      // Refresh token and retry once if authorization expired.
+      if (storageStatus == 401) {
+
+        if (firebaseSignIn()) {
+          storageStatus = uploadToStorage();
+        }
+      }
+
+      if (storageStatus == 200) {
+
+        int dbStatus = updateRealtimeDatabase();
+
+        if (dbStatus == 401) {
+
+          if (firebaseSignIn()) {
+            updateRealtimeDatabase();
+          }
+        }
+      }
+    }
+
+    // Start the next interval after this attempt finishes.
+    lastCaptureTime = millis();
+  }
+
+  delay(50);
+}

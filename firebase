@@ -11,7 +11,7 @@
 // =====================================================
 
 const char* WIFI_SSID = "Syed_Musab_pc";
-const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+const char* WIFI_PASSWORD = "12345678";
 
 // =====================================================
 // HIKVISION CAMERA
@@ -22,16 +22,16 @@ const char* CAMERA_URL =
   "http://192.168.137.211/ISAPI/Streaming/channels/102/picture";
 
 const char* CAMERA_USERNAME = "admin";
-const char* CAMERA_PASSWORD = "YOUR_CAMERA_PASSWORD";
+const char* CAMERA_PASSWORD = "NCAI#456";
 
 // =====================================================
 // FIREBASE
 // =====================================================
 
-const char* FIREBASE_API_KEY = "YOUR_FIREBASE_WEB_API_KEY";
+const char* FIREBASE_API_KEY = "AIzaSyBxJ1oVRArmuEIsoCfnS8pPoEH9tTeMWqU";
 
-const char* FIREBASE_EMAIL = "YOUR_FIREBASE_EMAIL";
-const char* FIREBASE_PASSWORD = "YOUR_FIREBASE_PASSWORD";
+const char* FIREBASE_EMAIL = "syedmusab742@gmail.com";
+const char* FIREBASE_PASSWORD = "12345678";
 
 const char* FIREBASE_BUCKET =
   "breathe-easy-ned.firebasestorage.app";

@@ -1,0 +1,1023 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <mbedtls/md5.h>
+#include <mbedtls/version.h>
+#include <esp_system.h>
+#include <time.h>
+#include <SPIFFS.h>
+#include <FS.h>
+#include <esp_partition.h>
+#include <Preferences.h>
+
+/// =====================================================
+// WIFI
+// =====================================================
+
+const char* WIFI_SSID = "Syed Musab pc";
+const char* WIFI_PASSWORD = "123456789";
+
+// =====================================================
+// HIKVISION CAMERA
+// =====================================================
+
+// Your camera's existing IP address
+const char* CAMERA_URL =
+  "http://192.168.137.195/ISAPI/Streaming/channels/101/picture";
+
+const char* CAMERA_USERNAME = "admin";
+const char* CAMERA_PASSWORD = "NCAI#456";
+
+// =====================================================
+// FIREBASE
+// =====================================================
+
+const char* FIREBASE_API_KEY = "AIzaSyBxJ1oVRArmuEIsoCfnS8pPoEH9tTeMWqU";
+
+const char* FIREBASE_EMAIL = "syedmusab742@gmail.com";
+const char* FIREBASE_PASSWORD = "12345678";
+const char* RTDB_HOST = "breathe-easy-ned-default-rtdb.firebaseio.com";
+
+// =====================================================
+// CONFIGURATION
+// =====================================================
+const unsigned long CAPTURE_INTERVAL = 5000;
+const unsigned long AUTH_REFRESH_INTERVAL = 50UL * 60UL * 1000UL;
+
+// Maximum allowed JPEG size: 3 MB.
+// Actual capture limit is calculated from free SPIFFS space.
+const size_t MAX_JPEG_SIZE = 3UL * 1024UL * 1024UL;
+const size_t SPIFFS_SAFETY_MARGIN = 32UL * 1024UL;
+
+const char* IMAGE_PATH = "/hikvision_latest.jpg";
+
+WiFiClientSecure secureClient;
+String firebaseIdToken;
+
+unsigned long lastAuthTime = 0;
+unsigned long lastCaptureTime = 0;
+
+size_t jpegLength = 0;
+bool spiffsReady = false;
+
+Preferences framePrefs;
+uint32_t nextFrameIndex = 0;
+
+// =====================================================
+// MD5 / HIKVISION DIGEST AUTHENTICATION
+// =====================================================
+String md5Hex(const String& value) {
+  unsigned char digest[16];
+
+#if MBEDTLS_VERSION_MAJOR >= 3
+  if (mbedtls_md5(
+        (const unsigned char*)value.c_str(),
+        value.length(), digest) != 0) return "";
+#else
+  if (mbedtls_md5_ret(
+        (const unsigned char*)value.c_str(),
+        value.length(), digest) != 0) return "";
+#endif
+
+  char out[33];
+
+  for (int i = 0; i < 16; ++i) {
+    sprintf(out + (i * 2), "%02x", digest[i]);
+  }
+
+  out[32] = '\0';
+  return String(out);
+}
+
+String digestField(const String& challenge, const char* field) {
+  String target = String(field);
+  size_t i = 0;
+
+  while (i < challenge.length()) {
+    while (i < challenge.length() &&
+           (challenge[i] == ' ' ||
+            challenge[i] == ',' ||
+            challenge[i] == '\t')) {
+      ++i;
+    }
+
+    size_t start = i;
+
+    while (i < challenge.length() &&
+           challenge[i] != '=' &&
+           challenge[i] != ',' &&
+           challenge[i] != ' ') {
+      ++i;
+    }
+
+    String key = challenge.substring(start, i);
+    key.trim();
+
+    while (i < challenge.length() && challenge[i] == ' ') ++i;
+
+    if (i >= challenge.length() || challenge[i] != '=') {
+      while (i < challenge.length() && challenge[i] != ',') ++i;
+      continue;
+    }
+
+    ++i;
+
+    while (i < challenge.length() && challenge[i] == ' ') ++i;
+
+    String val;
+
+    if (i < challenge.length() && challenge[i] == '"') {
+      ++i;
+
+      while (i < challenge.length()) {
+        if (challenge[i] == '"') {
+          ++i;
+          break;
+        }
+
+        if (challenge[i] == '\\' && i + 1 < challenge.length()) ++i;
+
+        val += challenge[i++];
+      }
+    } else {
+      size_t valueStart = i;
+
+      while (i < challenge.length() && challenge[i] != ',') ++i;
+
+      val = challenge.substring(valueStart, i);
+      val.trim();
+    }
+
+    if (key.equalsIgnoreCase(target)) return val;
+
+    while (i < challenge.length() && challenge[i] != ',') ++i;
+
+    if (i < challenge.length()) ++i;
+  }
+
+  return "";
+}
+
+String digestAuthHeader(const String& challenge) {
+  if (!challenge.startsWith("Digest ")) return "";
+
+  String realm = digestField(challenge, "realm");
+  String nonce = digestField(challenge, "nonce");
+  String qop = digestField(challenge, "qop");
+  String algorithm = digestField(challenge, "algorithm");
+  String opaque = digestField(challenge, "opaque");
+
+  if (realm.isEmpty() || nonce.isEmpty()) return "";
+
+  if (algorithm.length() && !algorithm.equalsIgnoreCase("MD5")) {
+    Serial.println("Unsupported camera Digest algorithm (MD5 required)");
+    return "";
+  }
+
+  if (qop.length()) {
+    bool hasAuth = false;
+    int from = 0;
+
+    while (from < qop.length()) {
+      int comma = qop.indexOf(',', from);
+
+      if (comma < 0) comma = qop.length();
+
+      String mode = qop.substring(from, comma);
+      mode.trim();
+
+      if (mode.equalsIgnoreCase("auth")) hasAuth = true;
+
+      from = comma + 1;
+    }
+
+    if (!hasAuth) {
+      Serial.println("Camera does not offer Digest qop=auth");
+      return "";
+    }
+  }
+
+  const String uri = "/ISAPI/Streaming/channels/101/picture";
+
+  char nonceCount[] = "00000001";
+  char randomHex[17];
+
+  snprintf(randomHex, sizeof(randomHex), "%08lx%08lx",
+           (unsigned long)esp_random(),
+           (unsigned long)esp_random());
+
+  String cnonce = randomHex;
+
+  String ha1 = md5Hex(
+    String(CAMERA_USERNAME) + ":" +
+    realm + ":" + CAMERA_PASSWORD
+  );
+
+  String ha2 = md5Hex("GET:" + uri);
+
+  String response = qop.length()
+    ? md5Hex(
+        ha1 + ":" + nonce + ":" +
+        nonceCount + ":" + cnonce + ":auth:" + ha2
+      )
+    : md5Hex(ha1 + ":" + nonce + ":" + ha2);
+
+  if (response.isEmpty()) return "";
+
+  String header =
+    "Digest username=\"" + String(CAMERA_USERNAME) +
+    "\", realm=\"" + realm +
+    "\", nonce=\"" + nonce +
+    "\", uri=\"" + uri +
+    "\", response=\"" + response + "\"";
+
+  if (qop.length()) {
+    header += ", qop=auth, nc=" + String(nonceCount) +
+              ", cnonce=\"" + cnonce + "\"";
+  }
+
+  header += ", algorithm=MD5";
+
+  if (opaque.length()) {
+    header += ", opaque=\"" + opaque + "\"";
+  }
+
+  return header;
+}
+
+// =====================================================
+// WIFI CONNECTION
+// =====================================================
+bool connectWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return true;
+
+  Serial.println("Connecting to WiFi...");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  unsigned long start = millis();
+
+  while (WiFi.status() != WL_CONNECTED &&
+         millis() - start < 20000UL) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi connection timed out");
+    return false;
+  }
+
+  Serial.print("ESP32 IP: ");
+  Serial.println(WiFi.localIP());
+
+  return true;
+}
+
+// =====================================================
+// FIREBASE AUTHENTICATION
+// =====================================================
+bool firebaseSignIn() {
+  Serial.println("Signing in to Firebase...");
+
+  HTTPClient http;
+
+  String url =
+    "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=";
+
+  url += FIREBASE_API_KEY;
+
+  if (!http.begin(secureClient, url)) return false;
+
+  http.setTimeout(20000);
+  http.addHeader("Content-Type", "application/json");
+
+  StaticJsonDocument<512> requestDoc;
+
+  requestDoc["email"] = FIREBASE_EMAIL;
+  requestDoc["password"] = FIREBASE_PASSWORD;
+  requestDoc["returnSecureToken"] = true;
+
+  String body;
+  serializeJson(requestDoc, body);
+
+  int status = http.POST(body);
+
+  String response = http.getString();
+
+  http.end();
+
+  if (status != 200) {
+    Serial.printf("Firebase login failed: HTTP %d\n", status);
+    Serial.println(response);
+    return false;
+  }
+
+  DynamicJsonDocument responseDoc(4096);
+
+  DeserializationError error =
+    deserializeJson(responseDoc, response);
+
+  if (error) {
+    Serial.println("Firebase login JSON parsing failed");
+    return false;
+  }
+
+  String newToken = responseDoc["idToken"].as<String>();
+
+  if (newToken.isEmpty()) {
+    Serial.println("Firebase ID token missing");
+    return false;
+  }
+
+  firebaseIdToken = newToken;
+  lastAuthTime = millis();
+
+  Serial.println("Firebase login successful");
+
+  return true;
+}
+
+bool ensureFirebaseAuth() {
+  if (firebaseIdToken.isEmpty() ||
+      millis() - lastAuthTime >= AUTH_REFRESH_INTERVAL) {
+    return firebaseSignIn();
+  }
+
+  return true;
+}
+
+// =====================================================
+// HIKVISION HIGH-RESOLUTION IMAGE CAPTURE
+// =====================================================
+bool captureCameraImage() {
+  Serial.println();
+  Serial.println("Capturing original Hikvision JPEG...");
+
+  jpegLength = 0;
+
+  // Calculate actual available SPIFFS space.
+  size_t freeSpace =
+    SPIFFS.totalBytes() - SPIFFS.usedBytes();
+
+  Serial.printf(
+    "SPIFFS free space: %u bytes (%.2f MB)\n",
+    (unsigned)freeSpace,
+    freeSpace / 1048576.0
+  );
+
+  // Leave storage for filesystem metadata.
+  if (freeSpace <= SPIFFS_SAFETY_MARGIN) {
+    Serial.println("SPIFFS has insufficient free space.");
+    return false;
+  }
+
+  // Use whichever is smaller:
+  // 1. Configured maximum of 3 MB
+  // 2. Actual free space minus safety margin
+  size_t effectiveJpegLimit =
+    freeSpace - SPIFFS_SAFETY_MARGIN;
+
+  if (effectiveJpegLimit > MAX_JPEG_SIZE) {
+    effectiveJpegLimit = MAX_JPEG_SIZE;
+  }
+
+  Serial.printf(
+    "Maximum JPEG size for this capture: %.2f MB\n",
+    effectiveJpegLimit / 1048576.0
+  );
+
+  // Request Digest authentication challenge.
+  WiFiClient challengeNet;
+  HTTPClient challengeHttp;
+
+  if (!challengeHttp.begin(challengeNet, CAMERA_URL)) {
+    Serial.println("Camera challenge connection failed");
+    return false;
+  }
+
+  challengeHttp.setTimeout(20000);
+  challengeHttp.setReuse(false);
+
+  const char* keys[] = {"WWW-Authenticate"};
+
+  challengeHttp.collectHeaders(keys, 1);
+
+  int firstStatus = challengeHttp.GET();
+
+  String challenge =
+    challengeHttp.header("WWW-Authenticate");
+
+  challengeHttp.end();
+
+  if (firstStatus != 401) {
+    Serial.printf(
+      "Expected HTTP 401 challenge, received %d\n",
+      firstStatus
+    );
+
+    return false;
+  }
+
+  String authorization = digestAuthHeader(challenge);
+
+  if (authorization.isEmpty()) {
+    Serial.println("Could not create camera Digest authorization");
+    return false;
+  }
+
+  // Request original JPEG with Digest authentication.
+  WiFiClient imageNet;
+  HTTPClient imageHttp;
+
+  if (!imageHttp.begin(imageNet, CAMERA_URL)) {
+    Serial.println("Camera image connection failed");
+    return false;
+  }
+
+  imageHttp.setTimeout(60000);
+  imageHttp.setReuse(false);
+
+  imageHttp.addHeader("Authorization", authorization);
+
+  int status = imageHttp.GET();
+
+  if (status != 200) {
+    Serial.printf(
+      "Camera authorized GET failed: HTTP %d\n",
+      status
+    );
+
+    imageHttp.end();
+    return false;
+  }
+
+  int advertisedLength = imageHttp.getSize();
+
+  Serial.printf(
+    "Camera advertised JPEG size: %d bytes\n",
+    advertisedLength
+  );
+
+  // Reject only if this particular image exceeds available space.
+  if (advertisedLength > 0 &&
+      (size_t)advertisedLength > effectiveJpegLimit) {
+
+    Serial.printf(
+      "JPEG needs %d bytes; safe available limit is %u bytes.\n",
+      advertisedLength,
+      (unsigned)effectiveJpegLimit
+    );
+
+    imageHttp.end();
+    return false;
+  }
+
+  // Stream image directly to SPIFFS.
+  SPIFFS.remove(IMAGE_PATH);
+
+  File file = SPIFFS.open(IMAGE_PATH, FILE_WRITE);
+
+  if (!file) {
+    Serial.println("Could not create image file in SPIFFS");
+    imageHttp.end();
+    return false;
+  }
+
+  int written = imageHttp.writeToStream(&file);
+
+  file.flush();
+  file.close();
+
+  imageHttp.end();
+
+  if (written <= 0 ||
+      (size_t)written > effectiveJpegLimit) {
+
+    Serial.printf(
+      "JPEG stream failed/too large for available SPIFFS: %d bytes\n",
+      written
+    );
+
+    SPIFFS.remove(IMAGE_PATH);
+    return false;
+  }
+
+  jpegLength = (size_t)written;
+
+  // Validate JPEG file and markers.
+  File verify = SPIFFS.open(IMAGE_PATH, FILE_READ);
+
+  if (!verify ||
+      verify.size() != jpegLength ||
+      jpegLength < 4) {
+
+    Serial.println("JPEG file is missing or incomplete");
+
+    if (verify) verify.close();
+
+    SPIFFS.remove(IMAGE_PATH);
+    return false;
+  }
+
+  bool startOK =
+    (verify.read() == 0xFF && verify.read() == 0xD8);
+
+  verify.seek(jpegLength - 2);
+
+  bool endOK =
+    (verify.read() == 0xFF && verify.read() == 0xD9);
+
+  verify.close();
+
+  if (!startOK || !endOK) {
+    Serial.println("JPEG start/end marker validation failed");
+
+    SPIFFS.remove(IMAGE_PATH);
+    return false;
+  }
+
+  Serial.println("--------------------------------");
+  Serial.println("HIGH-RESOLUTION JPEG CAPTURED");
+
+  Serial.printf(
+    "JPEG size: %.2f MB\n",
+    jpegLength / 1048576.0
+  );
+
+  Serial.printf(
+    "JPEG bytes: %u\n",
+    (unsigned)jpegLength
+  );
+
+  Serial.println("--------------------------------");
+
+  return true;
+}
+
+// =====================================================
+// STREAM JPEG AS BASE64 TO FIREBASE
+// =====================================================
+static const char B64[] =
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+bool writeAll(
+  WiFiClientSecure& net,
+  const uint8_t* data,
+  size_t count
+) {
+  size_t done = 0;
+
+  while (done < count) {
+    size_t sent = net.write(data + done, count - done);
+
+    if (sent == 0) return false;
+
+    done += sent;
+
+    delay(0);
+  }
+
+  return true;
+}
+
+bool sendBase64(WiFiClientSecure& net, File& jpeg) {
+  uint8_t input[768];
+  char output[1024];
+
+  while (jpeg.available()) {
+    int n = jpeg.read(input, sizeof(input));
+
+    if (n <= 0) return false;
+
+    size_t k = 0;
+
+    for (int i = 0; i < n; i += 3) {
+      const uint8_t a = input[i];
+
+      const uint8_t b =
+        (i + 1 < n) ? input[i + 1] : 0;
+
+      const uint8_t c =
+        (i + 2 < n) ? input[i + 2] : 0;
+
+      output[k++] = B64[a >> 2];
+
+      output[k++] =
+        B64[((a & 3) << 4) | (b >> 4)];
+
+      output[k++] =
+        (i + 1 < n)
+          ? B64[((b & 15) << 2) | (c >> 6)]
+          : '=';
+
+      output[k++] =
+        (i + 2 < n)
+          ? B64[c & 63]
+          : '=';
+    }
+
+    if (!writeAll(
+          net,
+          (const uint8_t*)output,
+          k
+        )) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// =====================================================
+// SAVE NUMBERED FRAME TO FIREBASE RTDB
+// =====================================================
+int saveNumberedFrame(uint32_t frameIndex) {
+  Serial.printf(
+    "Uploading /hikcam/frame-%lu ...\n",
+    (unsigned long)frameIndex
+  );
+
+  File jpeg = SPIFFS.open(IMAGE_PATH, FILE_READ);
+
+  if (!jpeg) {
+    Serial.println("Could not open JPEG for Firebase upload");
+    return -1;
+  }
+
+  size_t jpegBytes = jpeg.size();
+
+  if (jpegBytes != jpegLength ||
+      jpegBytes < 4 ||
+      jpegBytes > MAX_JPEG_SIZE) {
+
+    jpeg.close();
+
+    Serial.println("Invalid JPEG length before upload");
+
+    return -1;
+  }
+
+  time_t now = time(nullptr);
+
+  String prefix =
+    "{\"frameIndex\":" + String(frameIndex) +
+    ",\"cameraCaptured\":true,\"contentType\":\"image/jpeg\",\"sizeBytes\":";
+
+  prefix += String((unsigned)jpegBytes);
+
+  if (now > 1700000000) {
+    prefix += ",\"capturedAtUnix\":";
+    prefix += String((unsigned long)now);
+  }
+
+  prefix += ",\"capturedAtServerMs\":{\".sv\":\"timestamp\"}";
+  prefix += ",\"imageBase64\":\"";
+
+  const char* suffix = "\"}";
+
+  size_t encodedBytes =
+    ((jpegBytes + 2) / 3) * 4;
+
+  size_t bodyLength =
+    prefix.length() +
+    encodedBytes +
+    strlen(suffix);
+
+  // Testing configuration only.
+  // Use a trusted root CA certificate in production.
+  WiFiClientSecure net;
+
+  net.setInsecure();
+  net.setTimeout(60000);
+
+  if (!net.connect(RTDB_HOST, 443, 20000)) {
+    Serial.println("Firebase RTDB TLS connection failed");
+
+    jpeg.close();
+
+    return -1;
+  }
+
+  String path =
+    "/hikcam/frame-" + String(frameIndex) +
+    ".json?auth=" + firebaseIdToken;
+
+  String headers =
+    "PUT " + path + " HTTP/1.1\r\n";
+
+  headers += "Host: " + String(RTDB_HOST) + "\r\n";
+  headers += "User-Agent: ESP32-Hikvision\r\n";
+  headers += "Content-Type: application/json\r\n";
+  headers += "if-match: null_etag\r\n";
+  headers += "Connection: close\r\n";
+
+  headers +=
+    "Content-Length: " +
+    String((unsigned long)bodyLength);
+
+  headers += "\r\n\r\n";
+
+  bool sent = writeAll(
+    net,
+    (const uint8_t*)headers.c_str(),
+    headers.length()
+  );
+
+  if (sent) {
+    sent = writeAll(
+      net,
+      (const uint8_t*)prefix.c_str(),
+      prefix.length()
+    );
+  }
+
+  if (sent) {
+    sent = sendBase64(net, jpeg);
+  }
+
+  if (sent) {
+    sent = writeAll(
+      net,
+      (const uint8_t*)suffix,
+      strlen(suffix)
+    );
+  }
+
+  jpeg.close();
+
+  if (!sent) {
+    Serial.println("Firebase upload interrupted while streaming");
+
+    net.stop();
+
+    return -1;
+  }
+
+  // Read HTTP status line.
+  unsigned long start = millis();
+
+  while (!net.available() &&
+         net.connected() &&
+         millis() - start < 60000UL) {
+    delay(10);
+  }
+
+  if (!net.available()) {
+    Serial.println(
+      "Firebase response timeout; upload may have completed"
+    );
+
+    net.stop();
+
+    return -1;
+  }
+
+  String statusLine = net.readStringUntil('\n');
+
+  statusLine.trim();
+
+  int firstSpace = statusLine.indexOf(' ');
+
+  int responseStatus =
+    firstSpace > 0
+      ? statusLine.substring(firstSpace + 1).toInt()
+      : -1;
+
+  if (responseStatus == 200) {
+    Serial.printf(
+      "Saved frame-%lu successfully (%u JPEG bytes)\n",
+      (unsigned long)frameIndex,
+      (unsigned)jpegBytes
+    );
+  }
+  else if (responseStatus == 412) {
+    Serial.printf(
+      "frame-%lu already exists; trying next index\n",
+      (unsigned long)frameIndex
+    );
+  }
+  else {
+    Serial.printf(
+      "Firebase upload failed: HTTP %d\n",
+      responseStatus
+    );
+
+    unsigned long deadline = millis() + 2000;
+
+    while (millis() < deadline) {
+      if (net.available()) {
+        String line = net.readStringUntil('\n');
+
+        line.trim();
+
+        if (line.isEmpty()) break;
+      }
+      else if (!net.connected()) {
+        break;
+      }
+      else {
+        delay(5);
+      }
+    }
+
+    size_t printed = 0;
+
+    while (millis() < deadline && printed < 350) {
+      if (net.available()) {
+        Serial.write(net.read());
+        ++printed;
+      }
+      else if (!net.connected()) {
+        break;
+      }
+      else {
+        delay(5);
+      }
+    }
+
+    Serial.println();
+  }
+
+  net.stop();
+
+  return responseStatus;
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+void setup() {
+  Serial.begin(115200);
+
+  delay(500);
+
+  Serial.println();
+
+  Serial.println(
+    "ESP32 Hikvision -> Firebase High-Resolution Capture"
+  );
+
+  framePrefs.begin("hikcam", false);
+
+  nextFrameIndex =
+    framePrefs.getUInt("nextFrame", 0);
+
+  Serial.printf(
+    "Next frame index: %lu\n",
+    (unsigned long)nextFrameIndex
+  );
+
+  // Check SPIFFS partition.
+  const esp_partition_t* fsPart =
+    esp_partition_find_first(
+      ESP_PARTITION_TYPE_DATA,
+      ESP_PARTITION_SUBTYPE_DATA_SPIFFS,
+      nullptr
+    );
+
+  if (!fsPart) {
+    Serial.println(
+      "ERROR: Selected partition scheme has no SPIFFS partition."
+    );
+
+    return;
+  }
+
+  Serial.printf(
+    "SPIFFS partition size: %u bytes\n",
+    (unsigned)fsPart->size
+  );
+
+  // Do not automatically format filesystem.
+  spiffsReady = SPIFFS.begin(false);
+
+  if (!spiffsReady) {
+    Serial.println("ERROR: SPIFFS mount failed.");
+
+    Serial.println(
+      "Check your partition scheme and existing filesystem."
+    );
+
+    return;
+  }
+
+  Serial.printf(
+    "SPIFFS total: %u bytes\n",
+    (unsigned)SPIFFS.totalBytes()
+  );
+
+  Serial.printf(
+    "SPIFFS used: %u bytes\n",
+    (unsigned)SPIFFS.usedBytes()
+  );
+
+  Serial.printf(
+    "SPIFFS free: %u bytes\n",
+    (unsigned)(
+      SPIFFS.totalBytes() - SPIFFS.usedBytes()
+    )
+  );
+
+  if (SPIFFS.totalBytes() < MAX_JPEG_SIZE) {
+    Serial.println(
+      "INFO: SPIFFS partition is smaller than 3 MB."
+    );
+
+    Serial.println(
+      "Capture will use actual available free space."
+    );
+  }
+
+  // Testing only; configure trusted CA for production.
+  secureClient.setInsecure();
+
+  if (connectWiFi()) {
+    configTime(
+      0,
+      0,
+      "pool.ntp.org",
+      "time.google.com"
+    );
+
+    firebaseSignIn();
+  }
+
+  Serial.println("ESP32 system ready.");
+}
+
+// =====================================================
+// MAIN LOOP
+// =====================================================
+void loop() {
+  if (!spiffsReady) {
+    delay(5000);
+    return;
+  }
+
+  if (!connectWiFi()) {
+    delay(3000);
+    return;
+  }
+
+  if (!ensureFirebaseAuth()) {
+    delay(3000);
+    return;
+  }
+
+  if (millis() - lastCaptureTime >= CAPTURE_INTERVAL) {
+    lastCaptureTime = millis();
+
+    if (captureCameraImage()) {
+      int status = -1;
+
+      // Retry if frame already exists.
+      for (int attempt = 0; attempt < 8; ++attempt) {
+        status = saveNumberedFrame(nextFrameIndex);
+
+        if (status == 401 && firebaseSignIn()) {
+          status = saveNumberedFrame(nextFrameIndex);
+        }
+
+        if (status == 200) {
+          ++nextFrameIndex;
+
+          framePrefs.putUInt(
+            "nextFrame",
+            nextFrameIndex
+          );
+
+          break;
+        }
+
+        if (status == 412) {
+          ++nextFrameIndex;
+
+          framePrefs.putUInt(
+            "nextFrame",
+            nextFrameIndex
+          );
+
+          continue;
+        }
+
+        break;
+      }
+
+      if (status != 200) {
+        Serial.printf(
+          "Frame not confirmed in RTDB. HTTP status: %d\n",
+          status
+        );
+      }
+
+      SPIFFS.remove(IMAGE_PATH);
+    }
+  }
+
+  delay(50);
+}
